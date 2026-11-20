@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.2.3 - 2026-11-20
+
+- Recognize inherited PHPUnit parent assertion calls converted by Testo's
+  Rector bridge 0.3.6 so Laravel test classes can migrate without a manual
+  marker. Keep manual markers for unsupported calls and skipped rules.
+
 ## 0.2.2 - 2026-10-15
 
 - Document the released runtime 0.8.2 / migrator 0.2.1 pair and remove obsolete

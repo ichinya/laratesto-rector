@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Laratesto\Rector\Analysis;
 
+use Laratesto\Rector\Rules\PhpUnitFlatAssertionsRector;
+use Laratesto\Rector\Rules\PhpUnitTypedAssertionsRector;
 use PhpParser\Node;
 use PhpParser\NodeFinder;
 use PhpParser\Node\Arg;
@@ -18,9 +20,11 @@ use PhpParser\Node\Scalar;
 use PhpParser\Node\Stmt\Class_;
 use PHPStan\Analyser\Scope;
 use PHPStan\Type\ObjectType;
+use Rector\Config\RectorConfig;
 use Rector\NodeNameResolver\NodeNameResolver;
 use Rector\NodeTypeResolver\Node\AttributeKey;
 use Rector\PhpParser\AstResolver;
+use Rector\Skipper\Skipper\Skipper;
 
 /** @internal Classifies only the statically proven common-path signature matrix. */
 final class HttpCompatibilityAnalyzer
@@ -281,11 +285,19 @@ final class HttpCompatibilityAnalyzer
 
     private NodeFinder $nodeFinder;
 
+    private ?RectorConfig $rectorConfig = null;
+
     public function __construct(
         private readonly NodeNameResolver $nodeNameResolver,
         private readonly AstResolver $astResolver,
+        private readonly Skipper $skipper,
     ) {
         $this->nodeFinder = new NodeFinder();
+    }
+
+    public function useConfiguredAssertionRules(RectorConfig $rectorConfig): void
+    {
+        $this->rectorConfig = $rectorConfig;
     }
 
     /**
@@ -415,9 +427,8 @@ final class HttpCompatibilityAnalyzer
         // its matrix for them: a supported call converts, an unsupported one survives onto the
         // converted base and fatals at runtime. Classify them through the same carve-outs, and
         // `parent::` calls ALSO land on the converted base - the class extends the framework
-        // TestCase, whose converted form is Laratesto\Testing\LaravelTestCase - but the
-        // upstream assert rewrite skips parent receivers entirely, so they classify through
-        // the parent-specific carve-outs (classifyParentCall()).
+        // TestCase, whose converted form is Laratesto\Testing\LaravelTestCase.
+        // Classify them through the parent-specific checks in classifyParentCall().
         // The classification runs PER METHOD: the parent lifecycle carve-out only
         // covers a parent::setUp()/tearDown() call inside the matching lifecycle
         // override itself - the one location the base rule rewrites. The same
@@ -447,7 +458,7 @@ final class HttpCompatibilityAnalyzer
                         $reasons,
                         'HTTP_UNSUPPORTED_SIGNATURE',
                         $isParent
-                            ? 'dynamic parent:: method call cannot be classified; the upstream assert rewrite skips parent receivers, so the call would survive onto the converted base'
+                            ? 'dynamic parent:: method call cannot be classified, so the call would survive onto the converted base'
                             : 'dynamic self/static method cannot be classified',
                     );
 
@@ -460,7 +471,7 @@ final class HttpCompatibilityAnalyzer
                         $class,
                         $this->isRewrittenParentLifecycleCall($method, $staticCall),
                         $staticMethod,
-                        $staticCall->args,
+                        $staticCall,
                         $localClasses,
                     );
 
@@ -632,9 +643,8 @@ final class HttpCompatibilityAnalyzer
     /**
      * `parent::` calls land on the converted base: the analyzed class extends the
      * framework TestCase, whose converted form is Laratesto\Testing\LaravelTestCase
-     * (or a converted project base below it), and the upstream assert rewrite skips
-     * parent receivers entirely. Three carve-outs stay supported, everything else
-     * fails closed:
+     * (or a converted project base below it). Support calls with a known target
+     * or a proven rewrite in the assertion rules:
      *
      * 1. setUp()/tearDown() - but ONLY when the call sits inside the MATCHING
      *    lifecycle override, as a direct statement with the exact hook name: that exact
@@ -649,9 +659,9 @@ final class HttpCompatibilityAnalyzer
      *    conversion. The walk stops at the framework TestCase itself - its
      *    surface does not survive - and returns not-provable on unresolvable
      *    hops, which fails closed.
+     * 1d. PHPUnit assertions the configured flat or typed rule can rewrite.
      *
      * @param array<non-empty-string, list<non-empty-string>> $reasons
-     * @param list<Arg> $arguments
      * @param list<Class_> $localClasses
      */
     private function classifyParentCall(
@@ -659,7 +669,7 @@ final class HttpCompatibilityAnalyzer
         Class_ $class,
         bool $rewrittenLifecycleCall,
         string $method,
-        array $arguments,
+        StaticCall $call,
         array $localClasses,
     ): void
     {
@@ -667,6 +677,7 @@ final class HttpCompatibilityAnalyzer
             return;
         }
 
+        $arguments = $call->args;
         if (isset(self::REQUEST_SIGNATURES[$method])) {
             $this->validate($reasons, 'HTTP_UNSUPPORTED_SIGNATURE', $method, $arguments, self::REQUEST_SIGNATURES[$method]);
 
@@ -684,11 +695,39 @@ final class HttpCompatibilityAnalyzer
             return;
         }
 
+        $assertion = strtolower($method);
+        if ((str_starts_with($assertion, 'assert') || $assertion === 'fail')
+            && $this->canRewriteParentAssertion($call)) {
+            return;
+        }
+
         $this->addReason(
             $reasons,
             'HTTP_UNSUPPORTED_SIGNATURE',
-            sprintf('parent::%s() lands on the converted Laratesto base, which provides no such method; the upstream assert rewrite skips parent receivers - migrate manually', $method),
+            sprintf('parent::%s() lands on the converted Laratesto base, which provides no such method and no supported rewrite was found - migrate manually', $method),
         );
+    }
+
+    private function canRewriteParentAssertion(StaticCall $call): bool
+    {
+        $scope = $call->getAttribute(AttributeKey::SCOPE);
+        if (!$scope instanceof Scope || $this->rectorConfig === null) {
+            return false;
+        }
+
+        $configuredRules = $this->rectorConfig->getMainRectorClasses();
+        foreach ([PhpUnitFlatAssertionsRector::class, PhpUnitTypedAssertionsRector::class] as $ruleClass) {
+            if (!in_array($ruleClass, $configuredRules, true)) {
+                continue;
+            }
+            $rule = $this->rectorConfig->get($ruleClass);
+            if ($rule->refactor(clone $call) !== null
+                && !$this->skipper->shouldSkipElementAndFilePath($rule, $scope->getFile())) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function isRewrittenParentLifecycleCall(Node\Stmt\ClassMethod $method, StaticCall $call): bool
