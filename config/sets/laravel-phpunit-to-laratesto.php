@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Laratesto\Rector\Analysis\HttpCompatibilityAnalyzer;
 use Laratesto\Rector\Configuration\AutoloadPaths;
 use Laratesto\Rector\Configuration\ConfiguredHierarchy;
 use Laratesto\Rector\Rules\LaravelBaseClassRector;
@@ -49,6 +50,10 @@ return static function (RectorConfig $rectorConfig): void {
     // adopts the configured base classes into it and every Laravel rule reads them
     // from there, so a custom base_classes override governs the whole pipeline.
     $rectorConfig->singleton(ConfiguredHierarchy::class);
+    $rectorConfig->afterResolving(
+        HttpCompatibilityAnalyzer::class,
+        static fn (HttpCompatibilityAnalyzer $analyzer) => $analyzer->useConfiguredAssertionRules($rectorConfig),
+    );
 
     // Laravel-specific rules.
     $rectorConfig->ruleWithConfiguration(LaravelBaseClassRector::class, [

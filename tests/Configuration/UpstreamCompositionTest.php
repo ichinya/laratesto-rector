@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Laratesto\Rector\Tests\Configuration;
 
+use Composer\InstalledVersions;
 use Laratesto\Rector\Configuration\AutoloadPaths;
+use Laratesto\Rector\Rules\PhpUnitFlatAssertionsRector;
 use Laratesto\Rector\Set\LaratestoRectorSetList;
 use Symfony\Component\Process\Process;
 use Testo\Assert;
@@ -12,6 +14,35 @@ use Testo\Test;
 
 final class UpstreamCompositionTest
 {
+    #[Test]
+    public function parentAssertionUsesTheConfiguredBridgeRule(): void
+    {
+        $source = <<<'PHP'
+            <?php
+            final class ParentAssertionProbe extends \Illuminate\Foundation\Testing\TestCase {
+                public function testParent(): void {
+                    parent::assertEquals(expected: 7, actual: 8);
+                }
+            }
+            PHP;
+        $files = ['Tests.php' => $source];
+        $converted = $this->migrate($files)['Tests.php'];
+        $version = InstalledVersions::getVersion('testo/bridge-rector');
+        if ($version !== null && version_compare($version, '0.3.6', '>=')) {
+            Assert::string($converted)->contains('extends \Laratesto\Testing\LaravelTestCase');
+            Assert::string($converted)->contains('\Testo\Assert::equals(8, 7)');
+            Assert::string($converted)->notContains('laratesto-residual');
+        } else {
+            Assert::string($converted)->contains('HTTP_UNSUPPORTED_SIGNATURE');
+            Assert::string($converted)->contains('parent::assertEquals(expected: 7, actual: 8)');
+        }
+
+        $skipped = $this->migrate($files, skip: [PhpUnitFlatAssertionsRector::class])['Tests.php'];
+        Assert::string($skipped)->contains('extends \Illuminate\Foundation\Testing\TestCase');
+        Assert::string($skipped)->contains('HTTP_UNSUPPORTED_SIGNATURE');
+        Assert::string($skipped)->contains('parent::assertEquals(expected: 7, actual: 8)');
+    }
+
     #[Test]
     public function provenPositionalPredicatesReuseUpstreamWithRuntimeControls(): void
     {
@@ -168,8 +199,12 @@ final class UpstreamCompositionTest
         Assert::same(2, substr_count($files['Tests.php'], '#[\Testo\Skip('));
     }
 
-    /** @param array<string, string> $files @return array<string, string> */
-    private function migrate(array $files, ?string $vendorBase = null, ?array $expectedTotals = null): array
+    /**
+     * @param array<string, string> $files
+     * @param list<class-string> $skip
+     * @return array<string, string>
+     */
+    private function migrate(array $files, ?string $vendorBase = null, ?array $expectedTotals = null, array $skip = []): array
     {
         $root = dirname(__DIR__, 2);
         $tmp = sys_get_temp_dir() . '/laratesto-upstream-' . bin2hex(random_bytes(8));
@@ -186,10 +221,12 @@ final class UpstreamCompositionTest
             $autoload = var_export([...AutoloadPaths::forPackage(), $tmp . '/corpus', ...($vendorBase === null ? [] : [$tmp . '/vendor-base.php'])], true);
             $set = var_export(LaratestoRectorSetList::LARAVEL_PHPUNIT_TO_LARATESTO, true);
             $cache = var_export($tmp . '/cache', true);
+            $skippedRules = var_export($skip, true);
             file_put_contents($tmp . '/rector.php', <<<PHP
                 <?php
                 return \Rector\Config\RectorConfig::configure()
                     ->withPaths({$paths})->withSets([{$set}])
+                    ->withSkip({$skippedRules})
                     ->withAutoloadPaths({$autoload})->withCache(cacheDirectory: {$cache})->withoutParallel();
                 PHP);
 
